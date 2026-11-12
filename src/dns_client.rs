@@ -20,7 +20,7 @@ use crate::{
 
 use crate::libdns::{
     proto::{
-        DnsHandle, ProtoError,
+        DnsHandle, ProtoError, ProtoErrorKind,
         op::{Edns, Message, Query},
         rr::{
             Record, RecordType,
@@ -175,7 +175,18 @@ impl DnsClientBuilder {
             resolver
         };
 
-        assert!(!bootstrap.is_empty(), "no bootstrap nameserver found.");
+        if bootstrap.is_empty() {
+            // Instead of panicking (which crashes the whole process, especially
+            // painful when running as a Windows service), log a clear error and
+            // let the server continue starting. Queries will fail until the user
+            // adds upstream servers, but the process stays alive so the problem
+            // is diagnosable via logs rather than a silent crash.
+            log::error!(
+                "no bootstrap nameserver found. Please configure at least one \
+                 upstream DNS server (server / server-tls / server-https) or a \
+                 bootstrap-dns in your config file."
+            );
+        }
 
         let mut server_config_groups = HashMap::<Option<&str>, HashSet<&NameServerInfo>>::new();
         for (g, server_config) in server_infos.iter().flat_map(|serv_conf| {
@@ -403,6 +414,12 @@ mod name_server_group {
                 .iter()
                 .map(|ns| GenericResolver::lookup(ns.as_ref(), name.clone(), options.clone()))
                 .collect::<Vec<_>>();
+
+            // select_all panics on an empty iterator, so handle the no-server
+            // case explicitly instead of crashing the process.
+            if tasks.is_empty() {
+                return Err(LookupError::from(ProtoErrorKind::NoConnections));
+            }
 
             loop {
                 let (res, _idx, rest) = select_all(tasks).await;
@@ -652,21 +669,58 @@ mod bootstrap {
                 crate::libdns::resolver::system_conf::read_system_conf().unwrap_or_else(|err| {
                     warn!("read system conf failed, {}", err);
 
-                    use crate::preset_ns::{ALIDNS, CLOUDFLARE};
+                    use crate::preset_ns::{ALIDNS, CLOUDFLARE, DNSPOD, GOOGLE};
 
-                    let name_servers = ALIDNS.https().chain(CLOUDFLARE.https()).collect::<Vec<_>>();
+                    // Fallback to well-known public DNS servers.
+                    // Use UDP+TCP first (no TLS handshake needed for bootstrap),
+                    // then HTTPS as additional options. This avoids a chicken-and-egg
+                    // problem where HTTPS DNS requires resolving a hostname but no
+                    // bootstrap resolver is available.
+                    let name_servers = ALIDNS
+                        .udp_and_tcp()
+                        .chain(DNSPOD.udp_and_tcp())
+                        .chain(GOOGLE.udp_and_tcp())
+                        .chain(CLOUDFLARE.udp_and_tcp())
+                        .chain(ALIDNS.https())
+                        .chain(CLOUDFLARE.https())
+                        .collect::<Vec<_>>();
 
                     (
                         ResolverConfig::from_parts(None, vec![], name_servers),
                         ResolverOpts::default(),
                     )
                 });
+
             let mut name_servers = vec![];
 
             for config in resolv_config.name_servers() {
                 if let Ok(ns) = NameServer::new(DnsUrl::from(config).into(), None, None, None, None)
                 {
                     name_servers.push(Arc::new(ns));
+                }
+            }
+
+            // If the system conf yielded no usable nameservers (e.g. all servers
+            // failed to construct, or the system only has a loopback self-reference),
+            // fall back to hardcoded public DNS so the resolver can still function.
+            if name_servers.is_empty() {
+                warn!(
+                    "no usable nameserver from system conf, falling back to built-in public DNS"
+                );
+
+                use crate::preset_ns::{ALIDNS, CLOUDFLARE, DNSPOD, GOOGLE};
+
+                for config in ALIDNS
+                    .udp_and_tcp()
+                    .chain(DNSPOD.udp_and_tcp())
+                    .chain(GOOGLE.udp_and_tcp())
+                    .chain(CLOUDFLARE.udp_and_tcp())
+                {
+                    if let Ok(ns) =
+                        NameServer::new(DnsUrl::from(config).into(), None, None, None, None)
+                    {
+                        name_servers.push(Arc::new(ns));
+                    }
                 }
             }
 
