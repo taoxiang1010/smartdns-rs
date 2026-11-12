@@ -717,7 +717,7 @@ mod bootstrap {
                     .chain(CLOUDFLARE.udp_and_tcp())
                 {
                     if let Ok(ns) =
-                        NameServer::new(DnsUrl::from(config).into(), None, None, None, None)
+                        NameServer::new(DnsUrl::from(&config).into(), None, None, None, None)
                     {
                         name_servers.push(Arc::new(ns));
                     }
